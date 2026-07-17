@@ -1,0 +1,3 @@
+**Dataset**: [UCI Incident Management Process Enriched Event Log](https://archive.ics.uci.edu/dataset/498/incident+management+process+enriched+event+log)
+(download the "Incident Management Process Enriched" CSV, or fetch programmatically:
+`pip install ucimlrepo` → `fetch_ucirepo(id=498)`)
