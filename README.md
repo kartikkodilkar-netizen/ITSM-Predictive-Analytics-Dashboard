@@ -4,7 +4,7 @@ Predicting SLA breach risk on 24,918 ITSM incidents using a comparative machine 
 pipeline (Logistic Regression, Random Forest, Gradient Boosting), surfaced in an
 interactive Power BI dashboard for incident triage.
 
-**[Live Dashboard](#)** — **[Live Dashboard](https://app.powerbi.com/view?r=eyJrIjoiMDk3OThkZjAtZDY1YS00ZmY5LWJlNzAtOTZkNzQ2NzVlYTQ2IiwidCI6ImVlMTQyMGU0LWIzYTUtNGUwYi1hNTAxLTU2MTBiNTYyNmU5MCJ9)**
+]**[Live Dashboard](https://app.powerbi.com/view?r=eyJrIjoiMDk3OThkZjAtZDY1YS00ZmY5LWJlNzAtOTZkNzQ2NzVlYTQ2IiwidCI6ImVlMTQyMGU0LWIzYTUtNGUwYi1hNTAxLTU2MTBiNTYyNmU5MCJ9)**
 
 
 ## Problem
