@@ -1,1 +1,488 @@
+"""
+ITSM Predictive Analytics — Full ML Pipeline
 
+End-to-end pipeline: raw event log -> incident-level dataset -> feature
+engineering -> comparative model training (Logistic Regression, Random Forest,
+Gradient Boosting) across two targets (sla_breach, reopened) -> Power BI export.
+
+Built step-by-step, verifying output at each stage before proceeding.
+"""
+
+import pandas as pd
+
+# Load the raw event log
+df = pd.read_csv('/content/incident_event_log.csv')
+
+# Basic shape and preview
+print(df.shape)
+print(df.columns.tolist())
+print(df.head(10))
+
+# Confirm the duplicate-rows-per-incident issue
+print(df['number'].nunique(), "unique incidents")
+print(len(df), "total rows")
+
+# For each incident, check which columns actually change across its rows.
+# Columns that vary = they evolve over the incident's life (can't trust an
+# arbitrary row's value for these — need first row for features, last row for labels).
+# Columns that never vary = fixed at creation, safe to use directly.
+
+cols_to_check = [
+    'made_sla', 'reopen_count', 'reassignment_count', 'incident_state',
+    'priority', 'category', 'assignment_group', 'urgency', 'impact'
+]
+
+variation_summary = {}
+for col in cols_to_check:
+    n_unique_per_incident = df.groupby('number')[col].nunique()
+    pct_incidents_that_vary = (n_unique_per_incident > 1).mean()
+    variation_summary[col] = round(pct_incidents_that_vary * 100, 2)
+
+for col, pct in variation_summary.items():
+    print(f"{col}: varies within {pct}% of incidents")
+
+# Step 3: Build one row per incident
+#   - FEATURES come from the FIRST row (what's known at ticket creation)
+#   - LABELS come from the LAST row (final outcome)
+#
+# But first we need a reliable way to know which row is "first" and which
+# is "last" for each incident, since the raw file isn't guaranteed to be
+# in chronological order. sys_mod_count looks like an event counter
+# (0, 1, 2, 3...) that increases as the incident progresses, so we sort by it.
+
+df_sorted = df.sort_values(['number', 'sys_mod_count'])
+
+first_rows = df_sorted.groupby('number', as_index=False).first()
+last_rows = df_sorted.groupby('number', as_index=False).last()
+
+print("First rows shape:", first_rows.shape)
+print("Last rows shape:", last_rows.shape)
+
+# Sanity check: sys_mod_count in first_rows should mostly be 0 (start of life)
+print(first_rows['sys_mod_count'].value_counts().head())
+
+# Sanity check: sys_mod_count in last_rows should be higher / varied (end of life)
+print(last_rows['sys_mod_count'].describe())
+
+# Step 4: Select feature columns from first_rows, label columns from last_rows
+
+# Features: known at ticket creation. Based on what we found in Step 2:
+#   - priority, urgency, impact, category: barely change after creation -> safe
+#   - assignment_group: changes in 45% of incidents, but first-row value
+#     still reflects a real intake decision (which team it was first sent to)
+#   - contact_type, location, subcategory, u_symptom, opened_by, opened_at,
+#     knowledge: haven't checked variation on these yet, but they're
+#     intake-time fields by nature (how the ticket came in, who reported it,
+#     when) -> including them, flag for a variation check if you want one first
+#   - reassignment_count, incident_state: EXCLUDED (Step 2 showed these
+#     carry no real signal at intake time)
+
+feature_cols = [
+    'number',            # keep as an ID to join back to labels / Power BI later
+    'contact_type', 'location', 'category', 'subcategory', 'u_symptom',
+    'impact', 'urgency', 'priority', 'assignment_group', 'knowledge',
+    'opened_by', 'opened_at'
+]
+
+features = first_rows[feature_cols].copy()
+
+# Labels: final outcome, from last_rows
+labels = last_rows[['number', 'made_sla', 'reopen_count']].copy()
+
+print(features.shape)
+print(features.head())
+print(labels.shape)
+print(labels.head())
+
+# Step 4a: Check variation for the fields we assumed were stable but haven't verified
+# (contact_type, location, subcategory, u_symptom, opened_by, knowledge)
+
+more_cols_to_check = ['contact_type', 'location', 'subcategory', 'u_symptom', 'opened_by', 'knowledge']
+
+for col in more_cols_to_check:
+    n_unique_per_incident = df.groupby('number')[col].nunique()
+    pct_incidents_that_vary = (n_unique_per_incident > 1).mean()
+    print(f"{col}: varies within {round(pct_incidents_that_vary * 100, 2)}% of incidents")
+
+# Step 4: Build the features table (from first_rows) and labels table (from last_rows)
+
+feature_cols = [
+    'number',            # ID, used to join back to labels / Power BI later
+    'contact_type', 'location', 'category', 'subcategory', 'u_symptom',
+    'impact', 'urgency', 'priority', 'assignment_group', 'knowledge',
+    'opened_by', 'opened_at'
+]
+
+features = first_rows[feature_cols].copy()
+
+# Labels: final outcome, from last_rows
+labels = last_rows[['number', 'made_sla', 'reopen_count']].copy()
+
+print(features.shape)
+print(features.head())
+print()
+print(labels.shape)
+print(labels.head())
+
+# Step 5: Merge features + labels into one table, create binary targets
+
+data = features.merge(labels, on='number', how='inner')
+
+# made_sla is True/False already, but flip it so 1 = BREACH (the thing we want to predict/flag)
+data['sla_breach'] = (data['made_sla'] == False).astype(int)
+
+# reopen_count is a number (0, 1, 2, 3...) -> we only care whether it was reopened at all
+data['reopened'] = (data['reopen_count'] > 0).astype(int)
+
+# drop the original made_sla / reopen_count now that we have clean 0/1 versions
+data = data.drop(columns=['made_sla', 'reopen_count'])
+
+print(data.shape)
+print(data.head())
+print()
+print("SLA breach rate:", data['sla_breach'].mean())
+print("Reopen rate:", data['reopened'].mean())
+print()
+print("Missing values per column:")
+print(data.isnull().sum())
+
+# Step 6: Check cardinality of categorical columns before deciding how to encode them
+
+cat_cols = ['contact_type', 'location', 'category', 'subcategory', 'u_symptom',
+            'impact', 'urgency', 'priority', 'assignment_group', 'knowledge', 'opened_by']
+
+for col in cat_cols:
+    print(f"{col}: {data[col].nunique()} unique values")
+
+# Step 6a: One-hot encode the low-cardinality categorical columns
+
+low_card_cols = ['contact_type', 'impact', 'urgency', 'priority', 'knowledge']
+
+data_encoded = pd.get_dummies(data, columns=low_card_cols, drop_first=True)
+
+print(data_encoded.shape)
+print(data_encoded.columns.tolist())
+
+# Step 6b: Frequency-encode the high-cardinality categorical columns
+# Each category gets replaced by how often it appears across the dataset
+
+high_card_cols = ['location', 'category', 'subcategory', 'u_symptom', 'assignment_group', 'opened_by']
+
+for col in high_card_cols:
+    freq_map = data_encoded[col].value_counts(normalize=True)  # normalize=True gives a proportion, not a raw count
+    data_encoded[col + '_freq'] = data_encoded[col].map(freq_map)
+
+print(data_encoded.shape)
+print(data_encoded[['location', 'location_freq', 'assignment_group', 'assignment_group_freq']].head())
+
+# Step 6c: Drop original text columns (now replaced by _freq versions) and other
+# columns we don't feed into the model directly (number is an ID, opened_at is
+# still raw text — we'll turn it into real features in the next step)
+
+high_card_cols = ['location', 'category', 'subcategory', 'u_symptom', 'assignment_group', 'opened_by']
+
+data_encoded = data_encoded.drop(columns=high_card_cols)
+
+print(data_encoded.shape)
+print(data_encoded.columns.tolist())
+print(data_encoded.dtypes)
+
+# Step 7: Extract usable numeric features from the opened_at timestamp
+# Reasoning: the exact timestamp itself isn't reusable (e.g. "29/2/2016 01:16"
+# won't repeat), but the HOUR of day and DAY OF WEEK it was opened might
+# genuinely relate to SLA risk (e.g. tickets opened at 2am or on a weekend
+# might have slower response -> higher breach risk)
+
+data_encoded['opened_at'] = pd.to_datetime(data_encoded['opened_at'], format='%d/%m/%Y %H:%M', errors='coerce')
+
+data_encoded['open_hour'] = data_encoded['opened_at'].dt.hour
+data_encoded['open_dayofweek'] = data_encoded['opened_at'].dt.dayofweek  # 0 = Monday, 6 = Sunday
+data_encoded['open_is_weekend'] = data_encoded['open_dayofweek'].isin([5, 6]).astype(int)
+
+# check for any dates that failed to parse
+print("Rows where opened_at failed to parse:", data_encoded['opened_at'].isnull().sum())
+
+print(data_encoded[['opened_at', 'open_hour', 'open_dayofweek', 'open_is_weekend']].head())
+
+# Step 8: Final cleanup before modeling
+# - drop opened_at (already extracted into open_hour / open_dayofweek / open_is_weekend)
+# - set 'number' aside as an ID reference, not a model feature
+
+incident_ids = data_encoded['number'].copy()   # keep for later (joining predictions back)
+
+model_data = data_encoded.drop(columns=['opened_at', 'number'])
+
+print(model_data.shape)
+print(model_data.columns.tolist())
+print()
+print("Any remaining non-numeric columns?")
+print(model_data.dtypes[model_data.dtypes == 'object'])
+
+# Step 9: Train/test split for the sla_breach target
+from sklearn.model_selection import train_test_split
+
+target = 'sla_breach'
+feature_cols = [c for c in model_data.columns if c not in ['sla_breach', 'reopened']]
+
+X = model_data[feature_cols]
+y = model_data[target]
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+print("Train shape:", X_train.shape)
+print("Test shape:", X_test.shape)
+print()
+print("SLA breach rate in train:", y_train.mean())
+print("SLA breach rate in test:", y_test.mean())
+
+# Step 10: Train Logistic Regression on sla_breach
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+
+# Logistic Regression is sensitive to feature scale (e.g. open_hour ranges 0-23,
+# while location_freq ranges 0-0.22) -- so we scale features before feeding them in.
+# Tree-based models later (Random Forest, Gradient Boosting) won't need this step.
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# class_weight='balanced' tells the model to pay more attention to the minority
+# class relative to its size -- not strictly necessary here since 36.6% isn't
+# severely imbalanced, but it's good practice and costs nothing
+log_reg = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)
+log_reg.fit(X_train_scaled, y_train)
+
+y_pred = log_reg.predict(X_test_scaled)
+y_prob = log_reg.predict_proba(X_test_scaled)[:, 1]  # probability of class 1 (breach)
+
+print("Trained. First 10 predictions:", y_pred[:10])
+print("First 10 actual:", y_test.values[:10])
+
+# Step 11: Properly evaluate Logistic Regression on the full test set
+
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                              f1_score, roc_auc_score, confusion_matrix)
+
+accuracy = accuracy_score(y_test, y_pred)
+precision = precision_score(y_test, y_pred)
+recall = recall_score(y_test, y_pred)
+f1 = f1_score(y_test, y_pred)
+roc_auc = roc_auc_score(y_test, y_prob)
+cm = confusion_matrix(y_test, y_pred)
+
+print(f"Accuracy:  {accuracy:.3f}")
+print(f"Precision: {precision:.3f}")
+print(f"Recall:    {recall:.3f}")
+print(f"F1 score:  {f1:.3f}")
+print(f"ROC-AUC:   {roc_auc:.3f}")
+print()
+print("Confusion matrix:")
+print(cm)
+
+# Step 12: Train Random Forest on the SAME train/test split as Logistic Regression
+# Note: tree-based models don't need feature scaling, so we use X_train / X_test
+# directly (NOT the scaled versions) -- scaling would have no effect on trees anyway,
+# this just skips an unnecessary step
+
+from sklearn.ensemble import RandomForestClassifier
+
+rf = RandomForestClassifier(
+    n_estimators=300,      # number of trees in the forest
+    max_depth=12,          # limits how deep each tree can grow, helps prevent overfitting
+    class_weight='balanced',
+    random_state=42,
+    n_jobs=-1               # use all CPU cores to speed up training
+)
+rf.fit(X_train, y_train)
+
+y_pred_rf = rf.predict(X_test)
+y_prob_rf = rf.predict_proba(X_test)[:, 1]
+
+accuracy_rf = accuracy_score(y_test, y_pred_rf)
+precision_rf = precision_score(y_test, y_pred_rf)
+recall_rf = recall_score(y_test, y_pred_rf)
+f1_rf = f1_score(y_test, y_pred_rf)
+roc_auc_rf = roc_auc_score(y_test, y_prob_rf)
+cm_rf = confusion_matrix(y_test, y_pred_rf)
+
+print(f"Accuracy:  {accuracy_rf:.3f}")
+print(f"Precision: {precision_rf:.3f}")
+print(f"Recall:    {recall_rf:.3f}")
+print(f"F1 score:  {f1_rf:.3f}")
+print(f"ROC-AUC:   {roc_auc_rf:.3f}")
+print()
+print("Confusion matrix:")
+print(cm_rf)
+
+# Step 13: Train Gradient Boosting on the SAME train/test split
+
+from sklearn.ensemble import GradientBoostingClassifier
+
+gb = GradientBoostingClassifier(
+    n_estimators=200,
+    max_depth=4,           # boosted trees are usually kept shallower than RF trees
+    random_state=42
+)
+gb.fit(X_train, y_train)
+
+y_pred_gb = gb.predict(X_test)
+y_prob_gb = gb.predict_proba(X_test)[:, 1]
+
+accuracy_gb = accuracy_score(y_test, y_pred_gb)
+precision_gb = precision_score(y_test, y_pred_gb)
+recall_gb = recall_score(y_test, y_pred_gb)
+f1_gb = f1_score(y_test, y_pred_gb)
+roc_auc_gb = roc_auc_score(y_test, y_prob_gb)
+cm_gb = confusion_matrix(y_test, y_pred_gb)
+
+print(f"Accuracy:  {accuracy_gb:.3f}")
+print(f"Precision: {precision_gb:.3f}")
+print(f"Recall:    {recall_gb:.3f}")
+print(f"F1 score:  {f1_gb:.3f}")
+print(f"ROC-AUC:   {roc_auc_gb:.3f}")
+print()
+print("Confusion matrix:")
+print(cm_gb)
+
+# ===== Full pipeline for the 'reopened' target =====
+# Mirrors the exact same steps used for sla_breach: split -> Logistic Regression
+# -> Random Forest -> Gradient Boosting -> compare all three on the same metrics
+
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                              f1_score, roc_auc_score, confusion_matrix)
+
+target2 = 'reopened'
+feature_cols = [c for c in model_data.columns if c not in ['sla_breach', 'reopened']]
+
+X2 = model_data[feature_cols]
+y2 = model_data[target2]
+
+X2_train, X2_test, y2_train, y2_test = train_test_split(
+    X2, y2, test_size=0.2, random_state=42, stratify=y2
+)
+
+print("Train shape:", X2_train.shape, "| Reopen rate:", y2_train.mean())
+print("Test shape:", X2_test.shape, "| Reopen rate:", y2_test.mean())
+print()
+
+# ---- Logistic Regression (needs scaled features) ----
+scaler2 = StandardScaler()
+X2_train_scaled = scaler2.fit_transform(X2_train)
+X2_test_scaled = scaler2.transform(X2_test)
+
+log_reg2 = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)
+log_reg2.fit(X2_train_scaled, y2_train)
+y2_pred_lr = log_reg2.predict(X2_test_scaled)
+y2_prob_lr = log_reg2.predict_proba(X2_test_scaled)[:, 1]
+
+# ---- Random Forest ----
+rf2 = RandomForestClassifier(n_estimators=300, max_depth=12, class_weight='balanced',
+                              random_state=42, n_jobs=-1)
+rf2.fit(X2_train, y2_train)
+y2_pred_rf = rf2.predict(X2_test)
+y2_prob_rf = rf2.predict_proba(X2_test)[:, 1]
+
+# ---- Gradient Boosting ----
+gb2 = GradientBoostingClassifier(n_estimators=200, max_depth=4, random_state=42)
+gb2.fit(X2_train, y2_train)
+y2_pred_gb = gb2.predict(X2_test)
+y2_prob_gb = gb2.predict_proba(X2_test)[:, 1]
+
+# ---- Compare all three on the same metrics ----
+results = {}
+for name, y_pred, y_prob in [
+    ('Logistic Regression', y2_pred_lr, y2_prob_lr),
+    ('Random Forest', y2_pred_rf, y2_prob_rf),
+    ('Gradient Boosting', y2_pred_gb, y2_prob_gb),
+]:
+    results[name] = {
+        'accuracy': round(accuracy_score(y2_test, y_pred), 3),
+        'precision': round(precision_score(y2_test, y_pred, zero_division=0), 3),
+        'recall': round(recall_score(y2_test, y_pred, zero_division=0), 3),
+        'f1': round(f1_score(y2_test, y_pred, zero_division=0), 3),
+        'roc_auc': round(roc_auc_score(y2_test, y_prob), 3),
+        'confusion_matrix': confusion_matrix(y2_test, y_pred).tolist(),
+    }
+
+for name, m in results.items():
+    print(f"\n{name}")
+    for k, v in m.items():
+        print(f"  {k}: {v}")
+
+# ===== Step 15: Export results for Power BI (fixed — no variable name collisions) =====
+import pandas as pd
+
+metrics_rows = []
+
+# Recompute cleanly from the models directly rather than relying on loop-reused variable names
+sla_results = {
+    'Logistic Regression': (log_reg.predict(X_test_scaled), log_reg.predict_proba(X_test_scaled)[:, 1], y_test),
+    'Random Forest': (y_pred_rf, y_prob_rf, y_test),
+    'Gradient Boosting': (y_pred_gb, y_prob_gb, y_test),
+}
+reopen_results = {
+    'Logistic Regression': (log_reg2.predict(X2_test_scaled), log_reg2.predict_proba(X2_test_scaled)[:, 1], y2_test),
+    'Random Forest': (y2_pred_rf, y2_prob_rf, y2_test),
+    'Gradient Boosting': (y2_pred_gb, y2_prob_gb, y2_test),
+}
+
+for target_name, results_dict in [('sla_breach', sla_results), ('reopened', reopen_results)]:
+    for model_name, (pred, prob, actual) in results_dict.items():
+        cm = confusion_matrix(actual, pred)
+        metrics_rows.append({
+            'target': target_name, 'model': model_name,
+            'accuracy': round(accuracy_score(actual, pred), 4),
+            'precision': round(precision_score(actual, pred, zero_division=0), 4),
+            'recall': round(recall_score(actual, pred, zero_division=0), 4),
+            'f1': round(f1_score(actual, pred, zero_division=0), 4),
+            'roc_auc': round(roc_auc_score(actual, prob), 4),
+            'tn': int(cm[0,0]), 'fp': int(cm[0,1]), 'fn': int(cm[1,0]), 'tp': int(cm[1,1]),
+        })
+
+metrics_df = pd.DataFrame(metrics_rows)
+metrics_df.to_csv('model_comparison_metrics.csv', index=False)
+print(metrics_df)
+
+# feature importances and scored CSV sections are unaffected by this bug — but rerun
+# them in the same cell so file versions stay consistent
+importance_rows = []
+for target_name, model_name, model in [
+    ('sla_breach', 'Random Forest', rf), ('sla_breach', 'Gradient Boosting', gb),
+    ('sla_breach', 'Logistic Regression', log_reg),
+    ('reopened', 'Random Forest', rf2), ('reopened', 'Gradient Boosting', gb2),
+    ('reopened', 'Logistic Regression', log_reg2),
+]:
+    values = model.coef_[0] if model_name == 'Logistic Regression' else model.feature_importances_
+    for feat, val in zip(feature_cols, values):
+        importance_rows.append({'target': target_name, 'model': model_name,
+                                 'feature': feat, 'importance': round(float(val), 5)})
+pd.DataFrame(importance_rows).to_csv('feature_importances.csv', index=False)
+
+sla_scored = pd.DataFrame({
+    'number': incident_ids.loc[y_test.index], 'sla_breach_actual': y_test.values,
+    'sla_lr_pred': sla_results['Logistic Regression'][0], 'sla_lr_prob': sla_results['Logistic Regression'][1],
+    'sla_rf_pred': y_pred_rf, 'sla_rf_prob': y_prob_rf,
+    'sla_gb_pred': y_pred_gb, 'sla_gb_prob': y_prob_gb,
+})
+reopen_scored = pd.DataFrame({
+    'number': incident_ids.loc[y2_test.index], 'reopen_actual': y2_test.values,
+    'reopen_lr_pred': reopen_results['Logistic Regression'][0], 'reopen_lr_prob': reopen_results['Logistic Regression'][1],
+    'reopen_rf_pred': y2_pred_rf, 'reopen_rf_prob': y2_prob_rf,
+    'reopen_gb_pred': y2_pred_gb, 'reopen_gb_prob': y2_prob_gb,
+})
+scored = sla_scored.merge(reopen_scored, on='number', how='outer')
+scored.to_csv('scored_incidents_for_powerbi.csv', index=False)
+print("Saved.")
+
+# Save the pre-encoding, human-readable incident-level table for the Power BI overview page
+data.to_csv('incident_level_dataset.csv', index=False)
+
+from google.colab import files
+files.download('incident_level_dataset.csv')
